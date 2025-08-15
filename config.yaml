@@ -1,0 +1,22 @@
+server:
+  address: ":8080" # 可通过环境变量WEBSSH_SERVER_ADDRESS覆盖
+
+kubernetes:
+  config: "/etc/kubernetes/kubeconfig" # 可通过环境变量WEBSSH_KUBERNETES_CONFIG覆盖
+  kubectl:
+    path: "/usr/local/bin/kubectl" # 可通过环境变量WEBSSH_KUBERNETES_KUBECTL_PATH覆盖
+    default_namespace: "default" # 可通过环境变量WEBSSH_KUBERNETES_KUBECTL_DEFAULT_NAMESPACE覆盖
+
+terminal:
+  shell:
+    history_size: 5000 # 可通过环境变量WEBSSH_TERMINAL_SHELL_HISTORY_SIZE覆盖
+    completion: true # 可通过环境变量WEBSSH_TERMINAL_SHELL_COMPLETION覆盖
+    vi_mode: true # 可通过环境变量WEBSSH_TERMINAL_SHELL_VI_MODE覆盖
+    default_shell: "bash" # 可通过环境变量WEBSSH_TERMINAL_SHELL_DEFAULT_SHELL覆盖
+  features:
+    persistent_history: true # 可通过环境变量WEBSSH_TERMINAL_FEATURES_PERSISTENT_HISTORY覆盖
+    command_completion: true # 可通过环境变量WEBSSH_TERMINAL_FEATURES_COMMAND_COMPLETION覆盖
+
+auth:
+  verify_token_url: "http://api.budiuyun.net/applicationCloud/verifyWebsshToken" # 可通过环境变量WEBSSH_AUTH_VERIFY_TOKEN_URL覆盖
+  timeout: 5 # 可通过环境变量WEBSSH_AUTH_TIMEOUT覆盖
