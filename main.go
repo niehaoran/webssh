@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -152,29 +153,32 @@ func (t *TerminalSession) Close() {
 
 // 添加长文本分块处理方法
 var (
-	maxChunkSize     int           // 从配置读取
-	writeDelay       time.Duration // 从配置读取
-	confirmThreshold int           // 从配置读取
-	maxPasteSize     int           // 从配置读取
-	enableConfirm    bool          // 从配置读取
+	maxChunkSize       int           // 从配置读取
+	writeDelay         time.Duration // 从配置读取
+	confirmThreshold   int           // 从配置读取
+	maxPasteSize       int           // 从配置读取
+	enableConfirm      bool          // 从配置读取
+	useBracketPaste    bool          // 从配置读取
+	cleanControlChars  bool          // 从配置读取
+	multilineThreshold int           // 从配置读取
 )
 
 // 初始化粘贴配置
 func initPasteConfig() {
 	maxChunkSize = viper.GetInt("paste.max_chunk_size")
 	if maxChunkSize <= 0 {
-		maxChunkSize = 1024
+		maxChunkSize = 512 // 默认512字节
 	}
 
 	writeDelayMs := viper.GetInt("paste.write_delay_ms")
 	if writeDelayMs <= 0 {
-		writeDelayMs = 10
+		writeDelayMs = 20 // 默认20ms
 	}
 	writeDelay = time.Duration(writeDelayMs) * time.Millisecond
 
 	confirmThreshold = viper.GetInt("paste.confirm_threshold")
 	if confirmThreshold <= 0 {
-		confirmThreshold = 1024
+		confirmThreshold = 512 // 默认512字符
 	}
 
 	maxPasteSize = viper.GetInt("paste.max_paste_size")
@@ -183,6 +187,20 @@ func initPasteConfig() {
 	}
 
 	enableConfirm = viper.GetBool("paste.enable_confirmation")
+	useBracketPaste = viper.GetBool("paste.use_bracket_paste")
+	cleanControlChars = viper.GetBool("paste.clean_control_chars")
+
+	multilineThreshold = viper.GetInt("paste.multiline_threshold")
+	if multilineThreshold <= 0 {
+		multilineThreshold = 2
+	}
+
+	logger.Info("Paste configuration loaded",
+		zap.Int("max_chunk_size", maxChunkSize),
+		zap.Duration("write_delay", writeDelay),
+		zap.Int("confirm_threshold", confirmThreshold),
+		zap.Bool("enable_confirmation", enableConfirm),
+		zap.Bool("use_bracket_paste", useBracketPaste))
 }
 
 // processLongText 处理长文本，分块写入stdin
@@ -201,12 +219,14 @@ func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWrite
 		t.processMutex.Unlock()
 	}()
 
-	dataBytes := []byte(data)
+	// 清理和预处理数据
+	cleanData := t.cleanPasteData(data)
+	dataBytes := []byte(cleanData)
 	dataLen := len(dataBytes)
 
 	// 如果数据较小，直接写入
 	if dataLen <= maxChunkSize {
-		stdinWriter.Write(dataBytes)
+		t.writePasteData(stdinWriter, dataBytes)
 		return
 	}
 
@@ -217,11 +237,19 @@ func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWrite
 	}
 	t.conn.WriteJSON(startMsg)
 
+	// 进入粘贴模式：发送^[[200~ (bracket paste mode start)
+	if useBracketPaste {
+		stdinWriter.Write([]byte("\x1b[200~"))
+	}
+
 	// 分块处理大文本
 	totalChunks := (dataLen + maxChunkSize - 1) / maxChunkSize
 	for i := 0; i < dataLen; i += maxChunkSize {
 		select {
 		case <-t.done:
+			if useBracketPaste {
+				stdinWriter.Write([]byte("\x1b[201~"))
+			}
 			return
 		default:
 			end := i + maxChunkSize
@@ -238,6 +266,10 @@ func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWrite
 					Message: "粘贴失败: " + err.Error(),
 				}
 				t.conn.WriteJSON(errMsg)
+				// 退出粘贴模式
+				if useBracketPaste {
+					stdinWriter.Write([]byte("\x1b[201~"))
+				}
 				return
 			}
 
@@ -258,6 +290,11 @@ func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWrite
 		}
 	}
 
+	// 退出粘贴模式：发送^[[201~ (bracket paste mode end)
+	if useBracketPaste {
+		stdinWriter.Write([]byte("\x1b[201~"))
+	}
+
 	// 发送完成信息
 	completeMsg := &Message{
 		Type:    "paste_complete",
@@ -266,9 +303,70 @@ func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWrite
 	t.conn.WriteJSON(completeMsg)
 }
 
+// 安全地写入粘贴数据
+func (t *TerminalSession) writePasteData(stdinWriter *io.PipeWriter, data []byte) error {
+	if useBracketPaste {
+		// 进入粘贴模式
+		stdinWriter.Write([]byte("\x1b[200~"))
+	}
+
+	// 写入数据
+	_, err := stdinWriter.Write(data)
+
+	if useBracketPaste {
+		// 退出粘贴模式
+		stdinWriter.Write([]byte("\x1b[201~"))
+	}
+
+	return err
+}
+
+// 清理粘贴数据，处理特殊字符
+func (t *TerminalSession) cleanPasteData(data string) string {
+	if !cleanControlChars {
+		return data
+	}
+
+	// 移除或转义可能导致问题的控制字符
+	cleaned := strings.ReplaceAll(data, "\r\n", "\n") // 统一换行符
+	cleaned = strings.ReplaceAll(cleaned, "\r", "\n") // 处理Mac格式换行
+
+	// 移除可能导致终端混乱的控制序列
+	re := regexp.MustCompile(`\x1b\[[0-9;]*[mK]`) // 移除ANSI颜色码
+	cleaned = re.ReplaceAllString(cleaned, "")
+
+	// 移除其他危险的控制字符，但保留换行符和制表符
+	var result strings.Builder
+	for _, r := range cleaned {
+		if r == '\n' || r == '\t' || (r >= 32 && r <= 126) || r > 126 {
+			result.WriteRune(r)
+		}
+	}
+
+	return result.String()
+}
+
+// 检查数据是否需要清理（包含特殊字符或控制序列）
+func (t *TerminalSession) needsCleanup(data string) bool {
+	if !cleanControlChars {
+		return false
+	}
+
+	// 检查是否包含控制字符或ANSI序列
+	for _, r := range data {
+		if r < 32 && r != '\t' && r != '\n' {
+			return true
+		}
+	}
+
+	// 检查是否包含ANSI转义序列
+	return strings.Contains(data, "\x1b[")
+}
+
 // 检测是否为长文本粘贴
 func (t *TerminalSession) isLongText(data string) bool {
-	return len(data) > confirmThreshold || strings.Contains(data, "\n")
+	lineCount := strings.Count(data, "\n") + 1
+	return len(data) > confirmThreshold || lineCount >= multilineThreshold
 }
 
 func init() {
@@ -725,9 +823,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						if terminalSession.isLongText(msg.Data) {
 							go terminalSession.processLongText(msg.Data, stdinWriter)
 						} else {
-							_, err := stdinWriter.Write([]byte(msg.Data))
-							if err != nil {
-								logger.Error("Failed to write to stdin", zap.Error(err))
+							// 检查是否包含多行或特殊字符
+							if strings.Contains(msg.Data, "\n") || terminalSession.needsCleanup(msg.Data) {
+								// 使用安全粘贴方式
+								cleanData := terminalSession.cleanPasteData(msg.Data)
+								terminalSession.writePasteData(stdinWriter, []byte(cleanData))
+							} else {
+								// 普通单行文本直接写入
+								_, err := stdinWriter.Write([]byte(msg.Data))
+								if err != nil {
+									logger.Error("Failed to write to stdin", zap.Error(err))
+								}
 							}
 						}
 					}

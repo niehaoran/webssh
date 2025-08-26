@@ -13,8 +13,11 @@ auth:
 
 # 长文本处理配置
 paste:
-  max_chunk_size: 1024        # 每次写入的最大字节数
-  write_delay_ms: 10          # 写入间隔（毫秒）
-  confirm_threshold: 1024     # 超过此大小的文本需要用户确认
-  max_paste_size: 1048576     # 最大允许粘贴大小（1MB）
-  enable_confirmation: true   # 是否启用粘贴确认
+  max_chunk_size: 512          # 每次写入的最大字节数（减小以提高稳定性）
+  write_delay_ms: 20           # 写入间隔（毫秒）（增加以避免缓冲区溢出）
+  confirm_threshold: 512       # 超过此大小的文本需要用户确认（减小阈值）
+  max_paste_size: 1048576      # 最大允许粘贴大小（1MB）
+  enable_confirmation: true    # 是否启用粘贴确认
+  use_bracket_paste: true      # 是否使用括号粘贴模式（推荐）
+  clean_control_chars: true    # 是否清理控制字符
+  multiline_threshold: 2       # 多行文本的行数阈值
