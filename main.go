@@ -110,13 +110,9 @@ func (t *TerminalSession) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	// 处理终端输出，确保正确的换行和字符处理
-	output := string(p)
-
-	// 确保输出保持原始格式，不进行任何转换
 	msg := &Message{
 		Type: "output",
-		Data: output,
+		Data: string(p),
 	}
 	err := t.conn.WriteJSON(msg)
 	if err != nil {
@@ -279,16 +275,11 @@ func buildShellCommand(hasBash bool) []string {
              export LANG=en_US.UTF-8 && 
              export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ' && 
              export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin &&
-             export COLUMNS=$(tput cols) &&
-             export LINES=$(tput lines) &&
              stty icanon &&
              stty iexten &&
              stty -ixon &&
              stty -ixoff &&
              stty echo &&
-             stty -onlcr &&
-             stty -ocrnl &&
-             stty opost &&
              set -o emacs &&      # 启用行编辑功能
              if [ -f /etc/bash_completion ]; then
                  . /etc/bash_completion
@@ -329,14 +320,9 @@ func buildShellCommand(hasBash bool) []string {
 		"-c",
 		`export TERM=xterm-256color && 
          export PS1='$ ' && 
-         export COLUMNS=$(tput cols) &&
-         export LINES=$(tput lines) &&
          set -o vi &&
          stty icanon &&
          stty echo &&
-         stty -onlcr &&
-         stty -ocrnl &&
-         stty opost &&
          exec /bin/sh`,
 	}
 }
@@ -590,21 +576,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		case "resize":
 			if msg.Cols > 0 && msg.Rows > 0 {
-				size := remotecommand.TerminalSize{
+				terminalSession.sizeChan <- remotecommand.TerminalSize{
 					Width:  msg.Cols,
 					Height: msg.Rows,
-				}
-
-				// 更新会话中的终端大小
-				terminalSession.sizeMutex.Lock()
-				terminalSession.lastSize = size
-				terminalSession.sizeMutex.Unlock()
-
-				// 发送尺寸变化到终端
-				select {
-				case terminalSession.sizeChan <- size:
-				default:
-					// 如果 channel 满了，丢弃旧的大小事件
 				}
 			}
 
