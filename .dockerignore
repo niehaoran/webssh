@@ -27,9 +27,9 @@ vendor/
 *.log
 
 # 异常文件
-*[*
-[builder*
-[stage-*
+*\[*
+\[builder*
+\[stage-*
 
 # 临时文件
 *.tmp
