@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -70,11 +69,6 @@ type Message struct {
 	Cols          uint16 `json:"cols,omitempty"`
 	Rows          uint16 `json:"rows,omitempty"`
 	CtrlKey       string `json:"ctrlKey,omitempty"`
-	// 添加粘贴相关字段
-	PasteId      string `json:"pasteId,omitempty"`
-	ChunkIndex   int    `json:"chunkIndex,omitempty"`
-	TotalChunks  int    `json:"totalChunks,omitempty"`
-	IsLargePaste bool   `json:"isLargePaste,omitempty"`
 }
 
 type PodDetails struct {
@@ -92,10 +86,6 @@ type TerminalSession struct {
 	tty         bool
 	done        chan struct{}
 	env         map[string]string
-	// 添加长文本处理相关字段
-	inputBuffer  chan []byte
-	isProcessing bool
-	processMutex sync.Mutex
 }
 
 func (t *TerminalSession) Next() *remotecommand.TerminalSize {
@@ -145,228 +135,7 @@ func (t *TerminalSession) initializeEnv() {
 
 func (t *TerminalSession) Close() {
 	close(t.done)
-	if t.inputBuffer != nil {
-		close(t.inputBuffer)
-	}
 	t.conn.Close()
-}
-
-// 添加长文本分块处理方法
-var (
-	maxChunkSize       int           // 从配置读取
-	writeDelay         time.Duration // 从配置读取
-	confirmThreshold   int           // 从配置读取
-	maxPasteSize       int           // 从配置读取
-	enableConfirm      bool          // 从配置读取
-	useBracketPaste    bool          // 从配置读取
-	cleanControlChars  bool          // 从配置读取
-	multilineThreshold int           // 从配置读取
-)
-
-// 初始化粘贴配置
-func initPasteConfig() {
-	maxChunkSize = viper.GetInt("paste.max_chunk_size")
-	if maxChunkSize <= 0 {
-		maxChunkSize = 512 // 默认512字节
-	}
-
-	writeDelayMs := viper.GetInt("paste.write_delay_ms")
-	if writeDelayMs <= 0 {
-		writeDelayMs = 20 // 默认20ms
-	}
-	writeDelay = time.Duration(writeDelayMs) * time.Millisecond
-
-	confirmThreshold = viper.GetInt("paste.confirm_threshold")
-	if confirmThreshold <= 0 {
-		confirmThreshold = 512 // 默认512字符
-	}
-
-	maxPasteSize = viper.GetInt("paste.max_paste_size")
-	if maxPasteSize <= 0 {
-		maxPasteSize = 1048576 // 1MB
-	}
-
-	enableConfirm = viper.GetBool("paste.enable_confirmation")
-	useBracketPaste = viper.GetBool("paste.use_bracket_paste")
-	cleanControlChars = viper.GetBool("paste.clean_control_chars")
-
-	multilineThreshold = viper.GetInt("paste.multiline_threshold")
-	if multilineThreshold <= 0 {
-		multilineThreshold = 2
-	}
-
-	logger.Info("Paste configuration loaded",
-		zap.Int("max_chunk_size", maxChunkSize),
-		zap.Duration("write_delay", writeDelay),
-		zap.Int("confirm_threshold", confirmThreshold),
-		zap.Bool("enable_confirmation", enableConfirm),
-		zap.Bool("use_bracket_paste", useBracketPaste))
-}
-
-// processLongText 处理长文本，分块写入stdin
-func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWriter) {
-	t.processMutex.Lock()
-	if t.isProcessing {
-		t.processMutex.Unlock()
-		return
-	}
-	t.isProcessing = true
-	t.processMutex.Unlock()
-
-	defer func() {
-		t.processMutex.Lock()
-		t.isProcessing = false
-		t.processMutex.Unlock()
-	}()
-
-	// 清理和预处理数据
-	cleanData := t.cleanPasteData(data)
-	dataBytes := []byte(cleanData)
-	dataLen := len(dataBytes)
-
-	// 如果数据较小，直接写入
-	if dataLen <= maxChunkSize {
-		t.writePasteData(stdinWriter, dataBytes)
-		return
-	}
-
-	// 发送开始信息
-	startMsg := &Message{
-		Type:    "paste_start",
-		Message: fmt.Sprintf("开始粘贴 %d 字符...", dataLen),
-	}
-	t.conn.WriteJSON(startMsg)
-
-	// 进入粘贴模式：发送^[[200~ (bracket paste mode start)
-	if useBracketPaste {
-		stdinWriter.Write([]byte("\x1b[200~"))
-	}
-
-	// 分块处理大文本
-	totalChunks := (dataLen + maxChunkSize - 1) / maxChunkSize
-	for i := 0; i < dataLen; i += maxChunkSize {
-		select {
-		case <-t.done:
-			if useBracketPaste {
-				stdinWriter.Write([]byte("\x1b[201~"))
-			}
-			return
-		default:
-			end := i + maxChunkSize
-			if end > dataLen {
-				end = dataLen
-			}
-
-			chunk := dataBytes[i:end]
-			_, err := stdinWriter.Write(chunk)
-			if err != nil {
-				logger.Error("Failed to write chunk to stdin", zap.Error(err))
-				errMsg := &Message{
-					Type:    "paste_error",
-					Message: "粘贴失败: " + err.Error(),
-				}
-				t.conn.WriteJSON(errMsg)
-				// 退出粘贴模式
-				if useBracketPaste {
-					stdinWriter.Write([]byte("\x1b[201~"))
-				}
-				return
-			}
-
-			// 发送进度信息
-			currentChunk := (i / maxChunkSize) + 1
-			if currentChunk%10 == 0 || currentChunk == totalChunks {
-				progressMsg := &Message{
-					Type:    "paste_progress",
-					Message: fmt.Sprintf("粘贴进度: %d/%d (%d%%)", currentChunk, totalChunks, (currentChunk*100)/totalChunks),
-				}
-				t.conn.WriteJSON(progressMsg)
-			}
-
-			// 添加延迟，避免终端缓冲区溢出
-			if i+maxChunkSize < dataLen {
-				time.Sleep(writeDelay)
-			}
-		}
-	}
-
-	// 退出粘贴模式：发送^[[201~ (bracket paste mode end)
-	if useBracketPaste {
-		stdinWriter.Write([]byte("\x1b[201~"))
-	}
-
-	// 发送完成信息
-	completeMsg := &Message{
-		Type:    "paste_complete",
-		Message: fmt.Sprintf("粘贴完成! 共处理 %d 字符", dataLen),
-	}
-	t.conn.WriteJSON(completeMsg)
-}
-
-// 安全地写入粘贴数据
-func (t *TerminalSession) writePasteData(stdinWriter *io.PipeWriter, data []byte) error {
-	if useBracketPaste {
-		// 进入粘贴模式
-		stdinWriter.Write([]byte("\x1b[200~"))
-	}
-
-	// 写入数据
-	_, err := stdinWriter.Write(data)
-
-	if useBracketPaste {
-		// 退出粘贴模式
-		stdinWriter.Write([]byte("\x1b[201~"))
-	}
-
-	return err
-}
-
-// 清理粘贴数据，处理特殊字符
-func (t *TerminalSession) cleanPasteData(data string) string {
-	if !cleanControlChars {
-		return data
-	}
-
-	// 移除或转义可能导致问题的控制字符
-	cleaned := strings.ReplaceAll(data, "\r\n", "\n") // 统一换行符
-	cleaned = strings.ReplaceAll(cleaned, "\r", "\n") // 处理Mac格式换行
-
-	// 移除可能导致终端混乱的控制序列
-	re := regexp.MustCompile(`\x1b\[[0-9;]*[mK]`) // 移除ANSI颜色码
-	cleaned = re.ReplaceAllString(cleaned, "")
-
-	// 移除其他危险的控制字符，但保留换行符和制表符
-	var result strings.Builder
-	for _, r := range cleaned {
-		if r == '\n' || r == '\t' || (r >= 32 && r <= 126) || r > 126 {
-			result.WriteRune(r)
-		}
-	}
-
-	return result.String()
-}
-
-// 检查数据是否需要清理（包含特殊字符或控制序列）
-func (t *TerminalSession) needsCleanup(data string) bool {
-	if !cleanControlChars {
-		return false
-	}
-
-	// 检查是否包含控制字符或ANSI序列
-	for _, r := range data {
-		if r < 32 && r != '\t' && r != '\n' {
-			return true
-		}
-	}
-
-	// 检查是否包含ANSI转义序列
-	return strings.Contains(data, "\x1b[")
-}
-
-// 检测是否为长文本粘贴
-func (t *TerminalSession) isLongText(data string) bool {
-	lineCount := strings.Count(data, "\n") + 1
-	return len(data) > confirmThreshold || lineCount >= multilineThreshold
 }
 
 func init() {
@@ -381,7 +150,6 @@ func init() {
 
 	loadConfig()
 	initKubernetesClient()
-	initPasteConfig() // 初始化粘贴配置
 }
 
 func loadConfig() {
@@ -702,7 +470,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		sizeChan:    make(chan remotecommand.TerminalSize),
 		done:        make(chan struct{}),
 		tty:         true,
-		inputBuffer: make(chan []byte, 100), // 添加输入缓冲区
 	}
 	defer terminalSession.Close()
 
@@ -800,50 +567,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					// 尝试强制刷新
 					stdinWriter.Write([]byte{})
 				} else {
-					// 检查粘贴大小限制
-					if len(msg.Data) > maxPasteSize {
-						sendError(conn, fmt.Sprintf("粘贴内容过大 (%d 字符)，最大允许 %d 字符", len(msg.Data), maxPasteSize))
-						continue
-					}
-
-					// 检测是否为长文本，使用分块处理
-					if enableConfirm && terminalSession.isLongText(msg.Data) {
-						// 发送粘贴确认提示
-						dataLen := len(msg.Data)
-						lines := strings.Count(msg.Data, "\n") + 1
-						confirmMsg := &Message{
-							Type:         "paste_confirm",
-							Message:      fmt.Sprintf("检测到大文本粘贴 (%d 字符, %d 行)。是否继续？", dataLen, lines),
-							IsLargePaste: true,
-							Data:         msg.Data, // 暂存数据
-						}
-						conn.WriteJSON(confirmMsg)
-					} else {
-						// 根据大小决定处理方式
-						if terminalSession.isLongText(msg.Data) {
-							go terminalSession.processLongText(msg.Data, stdinWriter)
-						} else {
-							// 检查是否包含多行或特殊字符
-							if strings.Contains(msg.Data, "\n") || terminalSession.needsCleanup(msg.Data) {
-								// 使用安全粘贴方式
-								cleanData := terminalSession.cleanPasteData(msg.Data)
-								terminalSession.writePasteData(stdinWriter, []byte(cleanData))
-							} else {
-								// 普通单行文本直接写入
-								_, err := stdinWriter.Write([]byte(msg.Data))
-								if err != nil {
-									logger.Error("Failed to write to stdin", zap.Error(err))
-								}
-							}
-						}
+					_, err := stdinWriter.Write([]byte(msg.Data))
+					if err != nil {
+						logger.Error("Failed to write to stdin", zap.Error(err))
 					}
 				}
-			}
-
-		case "paste_confirm":
-			// 处理粘贴确认
-			if msg.Data != "" {
-				go terminalSession.processLongText(msg.Data, stdinWriter)
 			}
 
 		case "resize":

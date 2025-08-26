@@ -1,23 +1,22 @@
-# WebSSH服务配置
 server:
-  address: ":8080"
+  address: ":8080" # 可通过环境变量WEBSSH_SERVER_ADDRESS覆盖
 
-# Kubernetes配置
-k8s:
-  config_path: ""  # 留空将使用集群内配置
+kubernetes:
+  config: "/etc/kubernetes/kubeconfig" # 可通过环境变量WEBSSH_KUBERNETES_CONFIG覆盖
+  kubectl:
+    path: "/usr/local/bin/kubectl" # 可通过环境变量WEBSSH_KUBERNETES_KUBECTL_PATH覆盖
+    default_namespace: "default" # 可通过环境变量WEBSSH_KUBERNETES_KUBECTL_DEFAULT_NAMESPACE覆盖
 
-# 认证配置
+terminal:
+  shell:
+    history_size: 5000 # 可通过环境变量WEBSSH_TERMINAL_SHELL_HISTORY_SIZE覆盖
+    completion: true # 可通过环境变量WEBSSH_TERMINAL_SHELL_COMPLETION覆盖
+    vi_mode: true # 可通过环境变量WEBSSH_TERMINAL_SHELL_VI_MODE覆盖
+    default_shell: "bash" # 可通过环境变量WEBSSH_TERMINAL_SHELL_DEFAULT_SHELL覆盖
+  features:
+    persistent_history: true # 可通过环境变量WEBSSH_TERMINAL_FEATURES_PERSISTENT_HISTORY覆盖
+    command_completion: true # 可通过环境变量WEBSSH_TERMINAL_FEATURES_COMMAND_COMPLETION覆盖
+
 auth:
-  verify_token_url: ""  # 验证token的URL，留空将禁用认证
-  timeout: 5           # 超时时间（秒）
-
-# 长文本处理配置
-paste:
-  max_chunk_size: 512          # 每次写入的最大字节数（减小以提高稳定性）
-  write_delay_ms: 20           # 写入间隔（毫秒）（增加以避免缓冲区溢出）
-  confirm_threshold: 512       # 超过此大小的文本需要用户确认（减小阈值）
-  max_paste_size: 1048576      # 最大允许粘贴大小（1MB）
-  enable_confirmation: true    # 是否启用粘贴确认
-  use_bracket_paste: true      # 是否使用括号粘贴模式（推荐）
-  clean_control_chars: true    # 是否清理控制字符
-  multiline_threshold: 2       # 多行文本的行数阈值
+  verify_token_url: "http://api.budiuyun.net/applicationCloud/verifyWebsshToken" # 可通过环境变量WEBSSH_AUTH_VERIFY_TOKEN_URL覆盖
+  timeout: 5 # 可通过环境变量WEBSSH_AUTH_TIMEOUT覆盖
