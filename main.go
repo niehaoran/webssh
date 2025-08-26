@@ -69,6 +69,11 @@ type Message struct {
 	Cols          uint16 `json:"cols,omitempty"`
 	Rows          uint16 `json:"rows,omitempty"`
 	CtrlKey       string `json:"ctrlKey,omitempty"`
+	// 添加粘贴相关字段
+	PasteId      string `json:"pasteId,omitempty"`
+	ChunkIndex   int    `json:"chunkIndex,omitempty"`
+	TotalChunks  int    `json:"totalChunks,omitempty"`
+	IsLargePaste bool   `json:"isLargePaste,omitempty"`
 }
 
 type PodDetails struct {
@@ -86,6 +91,10 @@ type TerminalSession struct {
 	tty         bool
 	done        chan struct{}
 	env         map[string]string
+	// 添加长文本处理相关字段
+	inputBuffer  chan []byte
+	isProcessing bool
+	processMutex sync.Mutex
 }
 
 func (t *TerminalSession) Next() *remotecommand.TerminalSize {
@@ -135,7 +144,131 @@ func (t *TerminalSession) initializeEnv() {
 
 func (t *TerminalSession) Close() {
 	close(t.done)
+	if t.inputBuffer != nil {
+		close(t.inputBuffer)
+	}
 	t.conn.Close()
+}
+
+// 添加长文本分块处理方法
+var (
+	maxChunkSize     int           // 从配置读取
+	writeDelay       time.Duration // 从配置读取
+	confirmThreshold int           // 从配置读取
+	maxPasteSize     int           // 从配置读取
+	enableConfirm    bool          // 从配置读取
+)
+
+// 初始化粘贴配置
+func initPasteConfig() {
+	maxChunkSize = viper.GetInt("paste.max_chunk_size")
+	if maxChunkSize <= 0 {
+		maxChunkSize = 1024
+	}
+
+	writeDelayMs := viper.GetInt("paste.write_delay_ms")
+	if writeDelayMs <= 0 {
+		writeDelayMs = 10
+	}
+	writeDelay = time.Duration(writeDelayMs) * time.Millisecond
+
+	confirmThreshold = viper.GetInt("paste.confirm_threshold")
+	if confirmThreshold <= 0 {
+		confirmThreshold = 1024
+	}
+
+	maxPasteSize = viper.GetInt("paste.max_paste_size")
+	if maxPasteSize <= 0 {
+		maxPasteSize = 1048576 // 1MB
+	}
+
+	enableConfirm = viper.GetBool("paste.enable_confirmation")
+}
+
+// processLongText 处理长文本，分块写入stdin
+func (t *TerminalSession) processLongText(data string, stdinWriter *io.PipeWriter) {
+	t.processMutex.Lock()
+	if t.isProcessing {
+		t.processMutex.Unlock()
+		return
+	}
+	t.isProcessing = true
+	t.processMutex.Unlock()
+
+	defer func() {
+		t.processMutex.Lock()
+		t.isProcessing = false
+		t.processMutex.Unlock()
+	}()
+
+	dataBytes := []byte(data)
+	dataLen := len(dataBytes)
+
+	// 如果数据较小，直接写入
+	if dataLen <= maxChunkSize {
+		stdinWriter.Write(dataBytes)
+		return
+	}
+
+	// 发送开始信息
+	startMsg := &Message{
+		Type:    "paste_start",
+		Message: fmt.Sprintf("开始粘贴 %d 字符...", dataLen),
+	}
+	t.conn.WriteJSON(startMsg)
+
+	// 分块处理大文本
+	totalChunks := (dataLen + maxChunkSize - 1) / maxChunkSize
+	for i := 0; i < dataLen; i += maxChunkSize {
+		select {
+		case <-t.done:
+			return
+		default:
+			end := i + maxChunkSize
+			if end > dataLen {
+				end = dataLen
+			}
+
+			chunk := dataBytes[i:end]
+			_, err := stdinWriter.Write(chunk)
+			if err != nil {
+				logger.Error("Failed to write chunk to stdin", zap.Error(err))
+				errMsg := &Message{
+					Type:    "paste_error",
+					Message: "粘贴失败: " + err.Error(),
+				}
+				t.conn.WriteJSON(errMsg)
+				return
+			}
+
+			// 发送进度信息
+			currentChunk := (i / maxChunkSize) + 1
+			if currentChunk%10 == 0 || currentChunk == totalChunks {
+				progressMsg := &Message{
+					Type:    "paste_progress",
+					Message: fmt.Sprintf("粘贴进度: %d/%d (%d%%)", currentChunk, totalChunks, (currentChunk*100)/totalChunks),
+				}
+				t.conn.WriteJSON(progressMsg)
+			}
+
+			// 添加延迟，避免终端缓冲区溢出
+			if i+maxChunkSize < dataLen {
+				time.Sleep(writeDelay)
+			}
+		}
+	}
+
+	// 发送完成信息
+	completeMsg := &Message{
+		Type:    "paste_complete",
+		Message: fmt.Sprintf("粘贴完成! 共处理 %d 字符", dataLen),
+	}
+	t.conn.WriteJSON(completeMsg)
+}
+
+// 检测是否为长文本粘贴
+func (t *TerminalSession) isLongText(data string) bool {
+	return len(data) > confirmThreshold || strings.Contains(data, "\n")
 }
 
 func init() {
@@ -150,6 +283,7 @@ func init() {
 
 	loadConfig()
 	initKubernetesClient()
+	initPasteConfig() // 初始化粘贴配置
 }
 
 func loadConfig() {
@@ -205,18 +339,18 @@ func loadKubeConfig() (*rest.Config, error) {
 }
 
 // 验证token的函数
-func verifyToken(token string, userId string, namespace string, clusterId string) (bool, error) {
+// 支持三种验证端响应格式:
+// 1. 直接返回字符串 "true" 或 "false"
+// 2. 返回JSON格式 {"success": true/false}
+// 3. 根据HTTP状态码判断 (200=成功, 其他=失败)
+func verifyToken(token string, namespace string) (bool, error) {
 	verifyURL := viper.GetString("auth.verify_token_url")
 	timeout := viper.GetInt("auth.timeout")
 
-	// 添加spaceId参数 (从环境变量或配置获取)
-	spaceId := viper.GetString("auth.space_id") // 需要添加这个配置项
-
-	reqURL := fmt.Sprintf("%s?namespace=%s&clusterId=%s&spaceId=%s",
-		verifyURL, namespace, clusterId, spaceId)
+	reqURL := fmt.Sprintf("%s?namespace=%s", verifyURL, namespace)
 
 	// 打印请求信息
-	fmt.Printf("验证请求: URL=%s, userId=%s, namespace=%s\n", reqURL, userId, namespace)
+	fmt.Printf("验证请求: URL=%s, namespace=%s\n", reqURL, namespace)
 
 	req, err := http.NewRequest("POST", reqURL, nil)
 	if err != nil {
@@ -225,7 +359,6 @@ func verifyToken(token string, userId string, namespace string, clusterId string
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-token", token)
-	req.Header.Set("x-user-id", userId)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	client := &http.Client{
@@ -242,21 +375,29 @@ func verifyToken(token string, userId string, namespace string, clusterId string
 	body, _ := io.ReadAll(resp.Body)
 	fmt.Printf("响应状态码: %d\n响应内容: %s\n", resp.StatusCode, string(body))
 
+	// 方式1: 验证端直接返回 true 或 false
+	bodyStr := strings.TrimSpace(string(body))
+	if bodyStr == "true" {
+		return true, nil
+	} else if bodyStr == "false" {
+		return false, nil
+	}
+
+	// 方式2: 验证端返回 JSON 格式的 {"success": true/false}
 	var result struct {
-		Code    int    `json:"code"` // 改用 code 判断
-		Message string `json:"msg"`  // 字段名也要对应
-		Data    struct {
-			UserId    uint   `json:"userId"`
-			Namespace string `json:"namespace"`
-		} `json:"data"`
+		Success bool `json:"success"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&result); err == nil {
+		return result.Success, nil
 	}
 
-	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&result); err != nil {
-		fmt.Printf("解析响应失败: %v\n", err)
-		return false, err
+	// 方式3: 根据HTTP状态码判断 (200 = 成功, 其他 = 失败)
+	if resp.StatusCode == 200 {
+		return true, nil
 	}
 
-	return result.Code == 0, nil
+	// 默认返回false
+	return false, nil
 }
 
 func buildShellCommand(hasBash bool) []string {
@@ -410,22 +551,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if authEnabled {
 		// 获取认证信息
 		xToken := r.URL.Query().Get("x-token")
-		xUserId := r.URL.Query().Get("x-user-id")
 
-		if xToken == "" || xUserId == "" {
-			logger.Error("Missing token or userId")
+		if xToken == "" {
+			logger.Error("Missing token")
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		clusterId := r.URL.Query().Get("clusterId")
-		if clusterId == "" {
-			http.Error(w, "缺少 clusterId", http.StatusBadRequest)
-			return
-		}
-
 		// 验证token和资源访问权限
-		valid, err := verifyToken(xToken, xUserId, namespace, clusterId)
+		valid, err := verifyToken(xToken, namespace)
 		if err != nil {
 			logger.Error("Token verification failed",
 				zap.Error(err),
@@ -470,6 +604,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		sizeChan:    make(chan remotecommand.TerminalSize),
 		done:        make(chan struct{}),
 		tty:         true,
+		inputBuffer: make(chan []byte, 100), // 添加输入缓冲区
 	}
 	defer terminalSession.Close()
 
@@ -567,11 +702,42 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					// 尝试强制刷新
 					stdinWriter.Write([]byte{})
 				} else {
-					_, err := stdinWriter.Write([]byte(msg.Data))
-					if err != nil {
-						logger.Error("Failed to write to stdin", zap.Error(err))
+					// 检查粘贴大小限制
+					if len(msg.Data) > maxPasteSize {
+						sendError(conn, fmt.Sprintf("粘贴内容过大 (%d 字符)，最大允许 %d 字符", len(msg.Data), maxPasteSize))
+						continue
+					}
+
+					// 检测是否为长文本，使用分块处理
+					if enableConfirm && terminalSession.isLongText(msg.Data) {
+						// 发送粘贴确认提示
+						dataLen := len(msg.Data)
+						lines := strings.Count(msg.Data, "\n") + 1
+						confirmMsg := &Message{
+							Type:         "paste_confirm",
+							Message:      fmt.Sprintf("检测到大文本粘贴 (%d 字符, %d 行)。是否继续？", dataLen, lines),
+							IsLargePaste: true,
+							Data:         msg.Data, // 暂存数据
+						}
+						conn.WriteJSON(confirmMsg)
+					} else {
+						// 根据大小决定处理方式
+						if terminalSession.isLongText(msg.Data) {
+							go terminalSession.processLongText(msg.Data, stdinWriter)
+						} else {
+							_, err := stdinWriter.Write([]byte(msg.Data))
+							if err != nil {
+								logger.Error("Failed to write to stdin", zap.Error(err))
+							}
+						}
 					}
 				}
+			}
+
+		case "paste_confirm":
+			// 处理粘贴确认
+			if msg.Data != "" {
+				go terminalSession.processLongText(msg.Data, stdinWriter)
 			}
 
 		case "resize":
