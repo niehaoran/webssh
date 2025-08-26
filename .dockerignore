@@ -1,0 +1,43 @@
+# Git文件
+.git
+.gitignore
+
+# 构建文件
+*.exe
+*.dll
+*.so
+*.dylib
+webssh-go
+
+# 测试文件
+*_test.go
+*.test
+
+# 依赖和缓存
+vendor/
+.cache/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 异常文件
+'[*
+[builder*
+[stage-*
+
+# 临时文件
+*.tmp
+*.temp
+
+# 文档
+README.md
+*.md
+
+# 脚本
+cleanup.sh 
