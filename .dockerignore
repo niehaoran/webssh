@@ -27,7 +27,7 @@ vendor/
 *.log
 
 # 异常文件
-'[*
+*[*
 [builder*
 [stage-*
 
